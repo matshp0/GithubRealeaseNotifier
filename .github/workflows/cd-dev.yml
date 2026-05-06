@@ -4,12 +4,22 @@ on:
   push:
     branches:
       - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
   deploy:
+    needs: build
     uses: ./.github/workflows/deploy.yml
     with:
       environment: dev
       docker_compose_file: docker-compose.dev.yml
       env_file: .env.development
+      image_tag: ${{ needs.build.outputs.image_tag }}
     secrets: inherit

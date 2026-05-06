@@ -3,11 +3,20 @@ name: Deploy prod
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
   deploy:
+    needs: build
     uses: ./.github/workflows/deploy.yml
     with:
       environment: prod
       docker_compose_file: docker-compose.prod.yml
       env_file: .env
+      image_tag: ${{ needs.build.outputs.image_tag }}
     secrets: inherit

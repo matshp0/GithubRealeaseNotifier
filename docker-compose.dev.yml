@@ -1,5 +1,6 @@
 services:
   app:
+    image: ghcr.io/matshp0/githubrealeasenotifier-app:${IMAGE_TAG:-dev}
     build:
       context: .
       target: production
@@ -24,6 +25,7 @@ services:
         condition: service_started
 
   migrate:
+    image: ghcr.io/matshp0/githubrealeasenotifier-migrator:${IMAGE_TAG:-dev}
     build:
       context: .
       target: migrator
