@@ -9,6 +9,7 @@ declare module 'fastify' {
       POSTGRES_USER: string;
       POSTGRES_PASSWORD: string;
       POSTGRES_DATABASE: string;
+      POSTGRES_SSL: boolean;
       GITHUB_TOKEN: string;
       MAIL_HOST: string;
       MAIL_PORT: number;
@@ -51,6 +52,10 @@ const schema = {
     },
     POSTGRES_DATABASE: {
       type: 'string',
+    },
+    POSTGRES_SSL: {
+      type: 'boolean',
+      default: false,
     },
     GITHUB_TOKEN: {
       type: 'string',
