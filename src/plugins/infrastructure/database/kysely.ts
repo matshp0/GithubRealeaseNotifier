@@ -18,7 +18,10 @@ export const getDb = (fastify: FastifyInstance) => {
       user: fastify.config.POSTGRES_USER,
       password: fastify.config.POSTGRES_PASSWORD,
       port: fastify.config.POSTGRES_PORT,
-      ssl: fastify.config.POSTGRES_SSL ? { rejectUnauthorized: false } : false,
+      ssl:
+        fastify.config.POSTGRES_SSL === 'true'
+          ? { rejectUnauthorized: false }
+          : false,
       max: 10,
     }),
   });
