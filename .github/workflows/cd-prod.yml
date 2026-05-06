@@ -1,0 +1,13 @@
+name: Deploy prod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      docker_compose_file: docker-compose.prod.yml
+      env_file: .env
+    secrets: inherit

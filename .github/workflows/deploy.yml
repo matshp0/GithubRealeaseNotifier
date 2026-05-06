@@ -1,0 +1,53 @@
+name: Reusable deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      docker_compose_file:
+        required: true
+        type: string
+      env_file:
+        required: false
+        type: string
+        default: .env
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, "${{ inputs.environment }}"]
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Write env file
+        run: |
+          cat > ${{ inputs.env_file }} <<EOF
+          PORT=${{ vars.PORT }}
+          APP_URL=${{ vars.APP_URL }}
+          LOG_LEVEL=${{ vars.LOG_LEVEL }}
+          POSTGRES_HOST=${{ vars.POSTGRES_HOST }}
+          POSTGRES_PORT=${{ vars.POSTGRES_PORT }}
+          POSTGRES_USER=${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DATABASE=${{ vars.POSTGRES_DATABASE }}
+          POSTGRES_SSL=${{ vars.POSTGRES_SSL }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          GITHUB_TOKEN=${{ secrets.GH_PAT }}
+          SCAN_INTERVAL=${{ vars.SCAN_INTERVAL }}
+          MAIL_HOST=${{ vars.MAIL_HOST }}
+          MAIL_PORT=${{ vars.MAIL_PORT }}
+          MAIL_USER=${{ vars.MAIL_USER }}
+          MAIL_PASS=${{ secrets.MAIL_PASS }}
+          EOF
+
+      - name: Deploy stack
+        run: |
+          docker compose -f ${{ inputs.docker_compose_file }} --env-file ${{ inputs.env_file }} up -d --build --remove-orphans
