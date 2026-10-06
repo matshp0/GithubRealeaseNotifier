@@ -1,273 +1,202 @@
 # GitHub Release Notifier
 
-A self-hosted service that sends email notifications when a GitHub repository publishes a new release. Users subscribe to repositories via a REST API and receive a confirmation email. Once confirmed, they are notified whenever a new release tag is detected.
+A self-hosted service that sends email notifications when a GitHub repository publishes a new release. Users subscribe to `owner/repo` through a REST API, confirm the subscription by email, and are notified whenever a new release tag is detected.
 
-## How it works
+The system is built as a small **microservices** architecture in a pnpm + Turborepo monorepo. Services communicate over **RabbitMQ** (events) and HTTP (the subscribe saga), and share typed message contracts.
 
-1. A user subscribes to a repository by providing their email and the `owner/repo` slug.
-2. The service validates the repository exists on GitHub and sends a confirmation email.
-3. The user clicks the confirmation link to activate the subscription.
-4. A background scanner polls GitHub for new releases at a configurable interval.
-5. When a new release is detected, all confirmed subscribers receive an email with a link to the release.
+## Architecture
+
+```mermaid
+flowchart LR
+    user([User])
+    gh[GitHub REST API]
+    smtp[SMTP server]
+
+    subgraph services[Services]
+        api["api<br/>Fastify, scanner, outbox relay"]
+        ver["verification<br/>Fastify"]
+        mail["mailer<br/>RabbitMQ consumer"]
+    end
+
+    mq{{RabbitMQ}}
+    pgapi[(PostgreSQL<br/>github_notifier)]
+    pgver[(PostgreSQL<br/>mail_verification)]
+
+    user -->|REST| api
+    api -->|poll releases, ETag| gh
+    api --> pgapi
+    api -->|"HTTP: create / cancel verification"| ver
+    ver --> pgver
+    ver -->|confirmation email event| mq
+    api -->|release email events via outbox| mq
+    mq --> mail
+    mail --> smtp
+    smtp --> user
+```
+
+| Service | Path | Responsibility |
+|---|---|---|
+| **api** | `apps/api` | Public REST API (subscribe, confirm, unsubscribe, list), GitHub release scanner, transactional outbox relay |
+| **verification** | `apps/verification` | Creates and cancels email verifications, publishes the confirmation email event |
+| **mailer** | `apps/mailer` | Consumes email events from RabbitMQ, renders templates and sends them via SMTP |
+| **contracts** | `packages/contracts` | Shared event/request types, schemas, exchange and routing keys |
+
+### Subscribe saga (orchestrated by `api`)
+
+1. **T1 (local):** create a pending subscription. On failure of later steps: delete it.
+2. **T2 (remote):** ask `verification` to create a verification token. It publishes a confirmation email event. On failure: delete the subscription.
+3. **T3 (local):** store the confirm token and set the status to `awaiting_confirmation`. On failure: cancel the verification, then delete the subscription.
+
+Compensations are best-effort and never mask the original error.
+
+### Release notifications (transactional outbox)
+
+1. The scanner polls GitHub for each tracked repository using conditional requests (`ETag` / `If-None-Match`), so unchanged repositories return `304` and don't cost rate limit. It pauses when GitHub rate-limits it.
+2. When a new tag is found, the scanner writes one event per confirmed subscriber to an **outbox table** in the same database transaction as the repository update.
+3. The outbox relay publishes pending events to RabbitMQ in batches, with retries (max 5), and marks them processed or failed.
+4. `mailer` consumes the events and sends the emails. Delivery is **at-least-once**: a duplicate is acceptable, a lost notification is not.
 
 ## Tech stack
 
-| Layer | Technology |
+| Area | Technology |
 |---|---|
-| Runtime | Node.js 22 |
-| Language | TypeScript |
-| Framework | Fastify 5 |
-| Database | PostgreSQL 16 |
-| Query builder | Kysely |
-| Migrations | Prisma (migrations only) |
-| Email | Nodemailer |
-| Testing | Vitest |
-| Observability | Prometheus + Grafana |
+| Runtime / language | Node.js 22, TypeScript |
+| HTTP framework | Fastify 5 |
+| Messaging | RabbitMQ (`amqplib`) |
+| Database | PostgreSQL 16 (one database per service) |
+| Query builder / migrations | Kysely at runtime, Prisma for migrations only |
+| Email | Nodemailer (Mailpit in development) |
+| Monorepo | pnpm workspaces + Turborepo |
+| Testing | Vitest, Testcontainers (integration) |
+| Observability | Prometheus + Grafana (metrics), pino + Elasticsearch + Kibana (logs) |
+| CI/CD | GitHub Actions, Docker images on GHCR |
 
-## Project structure
+## Repository layout
 
 ```
-src/
-├── server.ts                        # Entry point
-├── app.ts                           # Fastify app factory
-├── common/
-│   ├── constants/pgErrorCodes.ts    # PostgreSQL error codes
-│   └── errors/                      # Domain error types
-├── modules/
-│   ├── scanner/
-│   │   ├── scanner.service.ts       # Release polling logic
-│   │   └── scanner.plugin.ts        # Scheduler lifecycle (setInterval, onReady)
-│   └── subscription/
-│       ├── subscription.controller.ts
-│       ├── subscription.service.ts
-│       └── schemas/                 # Request validation schemas
-└── plugins/
-    ├── config/env.ts                # Environment variable validation
-    ├── infrastructure/
-    │   ├── database/                # Kysely client + generated types
-    │   ├── github/octokit.ts        # Octokit client
-    │   └── mail/transporter.ts      # Nodemailer + concurrency queue
-    ├── repositories/
-    │   ├── gh-repo.repository.ts
-    │   └── subscription.repository.ts
-    └── services/
-        ├── github.service.ts
-        └── mail.service.ts
+apps/
+├── api/            # REST API, scanner, outbox relay  (port 3000)
+├── verification/   # verification service              (port 3002)
+└── mailer/         # RabbitMQ email consumer
+packages/
+└── contracts/      # shared event + request contracts
+docs/
+├── adr/            # architecture decision records
+└── system-design.md
+infra/              # Prometheus, Grafana, Postgres init
+docker-compose.dev.yml
+docker-compose.prod.yml
 ```
 
 ## API
 
-### `POST /api/subscribe`
+All endpoints are served by the `api` service.
 
-Subscribe an email address to release notifications for a repository.
-
-**Request body**
-
-```json
-{
-  "email": "you@example.com",
-  "repository": "owner/repo"
-}
-```
-
-**Validation**
-- `email` — valid email format
-- `repository` — must match the `owner/repo` pattern
-- The repository must exist on GitHub
-- Duplicate subscriptions return `409 Conflict`
-
-**Response**
-
-```json
-{ "message": "Subscription successful. Confirmation email sent." }
-```
-
----
-
-### `GET /api/confirm/:token`
-
-Confirms a subscription. The token is included in the confirmation email.
-
-**Response**
-
-```json
-{ "message": "Subscription confirmed" }
-```
-
----
-
-### `GET /api/unsubscribe/:token`
-
-Unsubscribes and permanently deletes the subscription. The token is included in every notification email.
-
-**Response**
-
-```json
-{ "message": "Unsubscribed successfully" }
-```
-
----
-
-### `GET /api/subscriptions?email=you@example.com`
-
-Returns all confirmed subscriptions for a given email address.
-
-**Response**
-
-```json
-[
-  { "id": "uuid", "email": "you@example.com", "repository": "owner/repo" }
-]
-```
-
----
-
-### `GET /metrics`
-
-Exposes Prometheus metrics (HTTP request counts, latencies, etc.).
-
-## Environment variables
-
-Copy `.env.example` to `.env` and fill in the values.
-
-| Variable | Description | Default |
+| Method | Path | Description |
 |---|---|---|
-| `PORT` | HTTP port | `3000` |
-| `POSTGRES_HOST` | PostgreSQL host | `localhost` |
-| `POSTGRES_PORT` | PostgreSQL port | `5432` |
-| `POSTGRES_USER` | PostgreSQL user | — |
-| `POSTGRES_PASSWORD` | PostgreSQL password | — |
-| `POSTGRES_DATABASE` | Database name | — |
-| `DATABASE_URL` | Full connection string (used by Prisma) | — |
-| `GITHUB_TOKEN` | GitHub personal access token | — |
-| `MAIL_HOST` | SMTP host | — |
-| `MAIL_PORT` | SMTP port | `587` |
-| `MAIL_USER` | SMTP username (leave empty to skip auth) | — |
-| `MAIL_PASS` | SMTP password | — |
-| `APP_URL` | Public base URL of the service (used in email links) | `http://localhost:3000` |
-| `SCAN_INTERVAL` | How often to poll GitHub for new releases, in minutes | `5` |
+| `POST` | `/api/subscribe` | Subscribe an email to a repository. Body: `{ "email": "you@example.com", "repository": "owner/repo" }`. `404` if the repository does not exist on GitHub, `409` on a duplicate. |
+| `GET` | `/api/confirm/:token` | Confirm a subscription (link from the confirmation email). |
+| `GET` | `/api/unsubscribe/:token` | Delete a subscription (link in every notification email). |
+| `GET` | `/api/subscriptions?email=you@example.com` | List confirmed subscriptions for an email. |
+| `GET` | `/metrics` | Prometheus metrics. |
 
-### GitHub token
-
-The token needs `public_repo` scope (or no scope at all for public repositories). Create one at **GitHub → Settings → Developer settings → Personal access tokens**.
+The `verification` service exposes an internal HTTP API used by the saga: `POST /verifications` and `POST /verifications/cancel`.
 
 ## Running with Docker
 
-The recommended way to run the full stack locally.
-
 ```bash
-# Clone and configure
 git clone https://github.com/matshp0/GithubRealeaseNotifier.git
 cd GithubRealeaseNotifier
-cp .env.example .env
-# Set GITHUB_TOKEN in .env
 
-# Start everything
-docker compose up --build
+# the scanner needs a GitHub token (public_repo scope, or no scope for public repos)
+echo "GITHUB_TOKEN=<your token>" > apps/api/.env.development
+
+docker compose -f docker-compose.dev.yml up --build
 ```
-
-This starts:
 
 | Service | URL | Description |
 |---|---|---|
-| App | http://localhost:3000 | REST API |
-| Mailpit | http://localhost:8025 | Email inspector UI |
-| Prometheus | http://localhost:9090 | Metrics scraper |
-| Grafana | http://localhost:3001 | Dashboards (admin / admin) |
-| PostgreSQL | localhost:5432 | Database |
+| api | http://localhost:3000 | REST API |
+| verification | http://localhost:3002 | Verification service |
+| Mailpit | http://localhost:8025 | Inbox for outgoing emails |
+| RabbitMQ | http://localhost:15672 | Management UI |
+| Prometheus | http://localhost:9090 | Metrics |
+| Grafana | http://localhost:3001 | Dashboards |
+| Kibana | http://localhost:5601 | Logs |
+| PostgreSQL | localhost:5432 | Databases |
 
-Database migrations run automatically via the `migrate` service on startup.
+Database migrations run automatically through the `migrate` and `verification-migrate` services on startup.
 
-## Monorepo layout
+Try it:
 
-This is a pnpm + turborepo monorepo:
+```bash
+curl -X POST http://localhost:3000/api/subscribe \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","repository":"nodejs/node"}'
+# open http://localhost:8025 and click the confirmation link
+```
 
-- `apps/api` — the Fastify HTTP service (the main application).
-- `packages/*` — shared packages (added as needed).
-
-Root scripts (`build`, `lint`, `test`, `dev`, ...) run through turbo across all
-workspaces. Run a single app's script with `pnpm --filter @github-notifier/api <script>`.
+`docker-compose.prod.yml` runs the published images from GHCR and reads its configuration from environment variables.
 
 ## Running locally (without Docker)
 
-Prerequisites: Node.js 22, pnpm (via `corepack enable`), a running PostgreSQL instance, an SMTP server (e.g. Mailpit).
+Prerequisites: Node.js 22, pnpm (`corepack enable`), PostgreSQL, RabbitMQ, an SMTP server (for example Mailpit).
 
 ```bash
 pnpm install
-
-# Run migrations
-pnpm db:migrate
-
-# Start with hot reload
-pnpm dev
+pnpm db:migrate     # api migrations
+pnpm dev            # runs all services through Turborepo
 ```
 
-## Database migrations
+## Configuration
 
-Prisma is used exclusively for migrations. Runtime queries go through Kysely.
-
-```bash
-# Create a new migration (development)
-pnpm db:migrate
-
-# Apply pending migrations (production / CI)
-pnpm db:migrate:deploy
-
-# Check migration status
-pnpm db:migrate:status
-```
+| Variable | Service | Description | Default |
+|---|---|---|---|
+| `PORT` | api, verification | HTTP port | `3000` / `3002` |
+| `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE` | api, verification | PostgreSQL connection | |
+| `DATABASE_URL` | migrations | Connection string used by Prisma | |
+| `RABBITMQ_URL` | all | RabbitMQ connection | `amqp://localhost:5672` |
+| `GITHUB_TOKEN` | api | GitHub personal access token | |
+| `SCAN_INTERVAL` | api | Minutes between GitHub polls | `5` |
+| `APP_URL` | api, mailer | Public base URL used in email links | `http://localhost:3000` |
+| `MAIL_VERIFICATION_URL` | api | Base URL of the verification service | |
+| `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`, `MAIL_PASS` | mailer | SMTP settings (empty user skips auth) | port `587` |
+| `ELASTICSEARCH_URL`, `ELASTICSEARCH_USER`, `ELASTICSEARCH_PASS` | api, verification | Ship logs to Elasticsearch (optional) | |
+| `LOG_LEVEL` | mailer, verification | Log level | `info` |
 
 ## Testing
 
 ```bash
-# Run all unit tests
-pnpm test
-
-# Watch mode
-pnpm exec vitest
+pnpm test:unit          # no Docker needed
+pnpm test:integration   # needs Docker, Testcontainers starts PostgreSQL and Mailpit
+pnpm test               # everything
 ```
 
-Tests are written with Vitest and use in-memory mocks — no database or network required.
+See [`testing.md`](testing.md) for details.
 
 ## Linting and formatting
 
 ```bash
-pnpm lint        # Check
-pnpm lint:fix    # Fix auto-fixable issues
+pnpm lint        # ESLint
+pnpm lint:fix
 pnpm format      # Prettier
 ```
 
-## CI
+A Husky pre-commit hook runs the checks locally.
 
-GitHub Actions runs linting and tests on every push and pull request (`.github/workflows/ci.yml`).
+## CI/CD
+
+- **CI** (`.github/workflows/ci.yml`): lint and tests on every push and pull request.
+- **SAST** (`sast.yml`): CodeQL analysis.
+- **Build / deploy** (`build.yml`, `deploy.yml`, `cd-dev.yml`, `cd-prod.yml`): build Docker images, push them to GHCR and deploy with Docker Compose.
+
+## Documentation
+
+- [`docs/adr`](docs/adr): architecture decision records (Fastify, PostgreSQL, Kysely + Prisma, ETag conditional requests).
+- [`docs/system-design.md`](docs/system-design.md): system design notes.
+- `docs/architecture.docx`: architecture diagram of the services, saga, outbox flow and observability stack.
 
 ## Observability
 
-The service exposes Prometheus metrics at `/metrics`. When running via Docker Compose, Prometheus scrapes this endpoint every 15 seconds and Grafana is pre-configured with Prometheus as the default datasource.
-
-To explore metrics in Grafana:
-1. Open http://localhost:3001 and log in with `admin` / `admin`
-2. Go to **Explore** → select the **Prometheus** datasource
-3. Query metrics such as `http_request_duration_seconds_count` or `http_requests_total`
-
-## Architecture notes
-
-**Plugin loading order**
-
-Fastify plugins are loaded in five sequential autoload passes to satisfy dependency declarations:
-
-```
-config → infrastructure → repositories → services → modules
-```
-
-**Background scanner**
-
-The scanner uses `setInterval` started in the `onReady` hook. An `isScanning` flag prevents overlapping runs. GitHub API calls use ETags so unchanged repositories result in `304 Not Modified` responses and count against the rate limit minimally.
-
-**Rate limiting**
-
-On a `429 Too Many Requests` response the scanner reads the `Retry-After` or `x-ratelimit-reset` header and suspends all GitHub calls until the reset time passes.
-
-**Email queue**
-
-Outbound emails go through an in-process queue with a concurrency limit of 5 to avoid overwhelming the SMTP connection. On graceful shutdown (`SIGTERM`) the server waits for the queue to drain before closing.
+- **Metrics:** `api` exposes `/metrics`; Prometheus scrapes it and Grafana is pre-provisioned with Prometheus as the default datasource.
+- **Logs:** services log JSON with pino and can ship logs to Elasticsearch, viewable in Kibana.
