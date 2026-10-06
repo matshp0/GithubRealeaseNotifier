@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Verification {
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String
+  repoFullName String              @map("repo_full_name")
+  token        String              @unique @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status       verification_status @default(pending)
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  confirmedAt  DateTime?           @map("confirmed_at") @db.Timestamptz(6)
+
+  @@index([token], map: "idx_verifications_token")
+  @@map("verifications")
+}
+
+enum verification_status {
+  pending
+  confirmed
+  cancelled
+  expired
+}

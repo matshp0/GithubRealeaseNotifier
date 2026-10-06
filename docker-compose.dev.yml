@@ -1,11 +1,12 @@
 services:
   app:
-    image: ghcr.io/matshp0/githubrealeasenotifier-app:${IMAGE_TAG:-dev}
+    restart: unless-stopped
     build:
       context: .
+      dockerfile: apps/api/Dockerfile
       target: production
     env_file:
-      - path: .env.development
+      - path: apps/api/.env.development
         required: false
     ports:
       - "${PORT:-3000}:3000"
@@ -13,27 +14,33 @@ services:
       PORT: ${PORT:-3000}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      MAIL_HOST: mailpit
-      MAIL_PORT: 1025
-      MAIL_USER: ""
-      MAIL_PASS: ""
+      RABBITMQ_URL: amqp://rabbitmq:5672
       APP_URL: http://localhost:3000
+      MAIL_VERIFICATION_URL: http://verification:3002
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_USER: elastic
+      ELASTICSEARCH_PASS: changeme
     depends_on:
       postgres:
         condition: service_healthy
-      mailpit:
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      verification:
         condition: service_started
 
   migrate:
-    image: ghcr.io/matshp0/githubrealeasenotifier-migrator:${IMAGE_TAG:-dev}
     build:
       context: .
+      dockerfile: apps/api/Dockerfile
       target: migrator
     env_file:
-      - path: .env.development
+      - path: apps/api/.env.development
         required: false
     environment:
       POSTGRES_HOST: postgres
+      DATABASE_URL: postgresql://myuser:mypassword@postgres:5432/github_notifier
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,6 +53,7 @@ services:
       POSTGRES_DB: github_notifier
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -59,6 +67,84 @@ services:
     ports:
       - "1025:1025"
       - "8025:8025"
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  email:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: apps/mailer/Dockerfile
+      target: production
+    env_file:
+      - path: apps/api/.env.development
+        required: false
+    environment:
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      MAIL_HOST: mailpit
+      MAIL_PORT: 1025
+      MAIL_USER: ""
+      MAIL_PASS: ""
+      APP_URL: http://localhost:3000
+      LOG_LEVEL: info
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+  verification:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: apps/verification/Dockerfile
+      target: production
+    env_file:
+      - path: apps/verification/.env.development
+        required: false
+    environment:
+      PORT: 3002
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DATABASE: mail_verification
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      LOG_LEVEL: info
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_USER: elastic
+      ELASTICSEARCH_PASS: changeme
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      verification-migrate:
+        condition: service_completed_successfully
+
+  verification-migrate:
+    build:
+      context: .
+      dockerfile: apps/verification/Dockerfile
+      target: migrator
+    environment:
+      DATABASE_URL: postgresql://myuser:mypassword@postgres:5432/mail_verification
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:latest
@@ -83,7 +169,47 @@ services:
     depends_on:
       - prometheus
 
+  elasticsearch:
+    image: elasticsearch:8.17.0
+    environment:
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=changeme
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u elastic:changeme http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  es-setup:
+    image: curlimages/curl:latest
+    entrypoint:
+      - sh
+      - -c
+      - |
+        curl -sf -u elastic:changeme -X POST http://elasticsearch:9200/_security/user/kibana_system/_password -H 'Content-Type: application/json' -d '{"password":"kibana_changeme"}'
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  kibana:
+    image: kibana:8.17.0
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: kibana_changeme
+    ports:
+      - "5601:5601"
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+
 volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+  elasticsearch_data:

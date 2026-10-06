@@ -1,8 +1,8 @@
 services:
   app:
-    image: ghcr.io/matshp0/githubrealeasenotifier-app:${IMAGE_TAG:-main}
     build:
       context: .
+      dockerfile: apps/api/Dockerfile
       target: production
     restart: unless-stopped
     ports:
@@ -14,23 +14,51 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DATABASE: ${POSTGRES_DATABASE}
-      POSTGRES_SSL: ${POSTGRES_SSL:-false}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       SCAN_INTERVAL: ${SCAN_INTERVAL:-5}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      APP_URL: ${APP_URL}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: migrator
+    restart: on-failure
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  email:
+    build:
+      context: .
+      dockerfile: apps/mailer/Dockerfile
+      target: production
+    restart: unless-stopped
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL}
       MAIL_HOST: ${MAIL_HOST}
       MAIL_PORT: ${MAIL_PORT}
       MAIL_USER: ${MAIL_USER}
       MAIL_PASS: ${MAIL_PASS}
       APP_URL: ${APP_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
-      migrate:
-        condition: service_completed_successfully
-
-  migrate:
-    image: ghcr.io/matshp0/githubrealeasenotifier-migrator:${IMAGE_TAG:-main}
-    build:
-      context: .
-      target: migrator
-    restart: on-failure
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
+      rabbitmq:
+        condition: service_healthy

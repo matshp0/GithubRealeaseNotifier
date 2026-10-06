@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Repository {
+  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fullName      String         @unique @map("full_name")
+  lastSeenTag   String?        @map("last_seen_tag")
+  etag          String?
+  lastCheckedAt DateTime?      @default(now()) @map("last_checked_at") @db.Timestamptz(6)
+  subscriptions Subscription[]
+
+  @@index([lastCheckedAt], map: "idx_repositories_last_checked")
+  @@map("repositories")
+}
+
+model Subscription {
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String
+  repositoryId String              @map("repository_id") @db.Uuid
+  status       subscription_status @default(pending)
+  confirmToken String              @unique @default(dbgenerated("gen_random_uuid()")) @map("confirm_token") @db.Uuid
+  unsubToken   String              @unique @default(dbgenerated("gen_random_uuid()")) @map("unsub_token") @db.Uuid
+  repository   Repository          @relation(fields: [repositoryId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([email, repositoryId])
+  @@index([confirmToken], map: "idx_subscriptions_confirm_token")
+  @@index([unsubToken], map: "idx_subscriptions_unsub_token")
+  @@map("subscriptions")
+}
+
+enum subscription_status {
+  pending
+  confirmed
+  unsubscribed
+  awaiting_confirmation
+}
+
+model NotificationOutbox {
+  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  routingKey  String               @map("routing_key")
+  payload     Json
+  status      outbox_event_status  @default(pending)
+  retryCount  Int                  @default(0) @map("retry_count")
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  processedAt DateTime?            @map("processed_at") @db.Timestamptz(6)
+
+  @@index([status, createdAt], map: "idx_notification_outbox_status_created")
+  @@map("notification_outbox")
+}
+
+enum outbox_event_status {
+  pending
+  processed
+  failed
+}
